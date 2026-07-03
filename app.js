@@ -101,6 +101,7 @@ function showToast(msg){
 let duration = 0;
 let strips = [];
 let selectedId = null;
+let selectedIds = new Set();
 let nextId = 1;
 let clipboard = null;
 let stripPlaying = null;
@@ -108,6 +109,20 @@ let waveform = null;
 let hover = {id:null, part:null};
 let ctxTargetId = null;
 const SNAP_PX = 10;
+
+// undo/redo stacks
+const UNDO_LIMIT = 80;
+let undoStack = [];
+let redoStack = [];
+
+function snapshot(){ return { strips: JSON.parse(JSON.stringify(strips)), nextId }; }
+function restoreSnapshot(snap){ strips = snap.strips.map(s=>Object.assign({}, s)); nextId = snap.nextId; select(null); drawTimeline(); refreshPanel(); }
+function saveStateForUndo(){ undoStack.push(snapshot()); if(undoStack.length>UNDO_LIMIT) undoStack.shift(); redoStack = []; }
+function undo(){ if(undoStack.length===0) return; redoStack.push(snapshot()); const snap = undoStack.pop(); restoreSnapshot(snap); }
+function redo(){ if(redoStack.length===0) return; undoStack.push(snapshot()); const snap = redoStack.pop(); restoreSnapshot(snap); }
+
+// track pointer inside timeline for Ctrl+A behavior
+let pointerOverTimeline = false;
 
 let viewStart = 0;
 let pxPerSec = 50;
@@ -131,6 +146,37 @@ const FPS = 30; // assumed rate for frame-based stepping/display — browsers do
 const panSlider = document.getElementById('panSlider');
 const sidebarEl = document.querySelector('.sidebar');
 const ctxMenu = document.getElementById('ctxMenu');
+
+// Create small icon buttons and replace existing button labels for compact UI
+function makeIcon(html){ const span = document.createElement('span'); span.className='icon'; span.innerHTML = html; return span; }
+try{
+  addStripBtn.innerHTML = ''; addStripBtn.appendChild(makeIcon('➕'));
+  dupBtn.innerHTML = ''; dupBtn.appendChild(makeIcon('⎘'));
+  copyBtn.innerHTML = ''; copyBtn.appendChild(makeIcon('📋'));
+  pasteBtn.innerHTML = ''; pasteBtn.appendChild(makeIcon('📥'));
+  deleteBtnTop.innerHTML = ''; deleteBtnTop.appendChild(makeIcon('🗑'));
+  playStripBtn.innerHTML = ''; playStripBtn.appendChild(makeIcon('▶'));
+  exportBtn.innerHTML = ''; exportBtn.appendChild(makeIcon('⬇'));
+}catch(err){ }
+
+// add undo/redo, clear all and new project buttons near addStripBtn if toolbar present
+(function addExtraButtons(){
+  const toolbar = addStripBtn && addStripBtn.parentNode;
+  if(!toolbar) return;
+  const btns = [
+    {id:'undoBtn', title:'Undo (Ctrl+Z)', icon:'↺', on:()=>undo()},
+    {id:'redoBtn', title:'Redo (Ctrl+Shift+Z)', icon:'↻', on:()=>redo()},
+    {id:'clearAllBtn', title:'Remove all strips', icon:'🧹', on:()=>{ if(strips.length===0) return; saveStateForUndo(); strips=[]; select(null); drawTimeline(); showToast('All strips removed'); }},
+    {id:'newProjectBtn', title:'New project', icon:'🆕', on:()=>{
+      saveStateForUndo(); strips=[]; nextId=1; selectedIds.clear(); selectedId=null; video.pause(); video.src=''; video.style.display='none'; emptyHint.style.display='block'; waveform=null; duration=0; addStripBtn.disabled=true; exportBtn.disabled=true; fitView(); drawTimeline(); showToast('New project started');
+    }}
+  ];
+  btns.forEach(b=>{
+    if(document.getElementById(b.id)) return;
+    const n=document.createElement('button'); n.id=b.id; n.className='icon-btn'; n.title=b.title; n.appendChild(makeIcon(b.icon)); n.addEventListener('click', b.on);
+    toolbar.insertBefore(n, addStripBtn);
+  });
+})();
 
 /* ============ media load ============ */
 mediaInput.addEventListener('change', e=>{
@@ -248,6 +294,9 @@ function zoomAt(x, factor){
 /* ============ timeline canvas ============ */
 const tl = document.getElementById('timeline');
 const tlCtx = tl.getContext('2d');
+// track pointer inside timeline for Ctrl+A behavior (attach after element exists)
+tl.addEventListener('mouseenter', ()=>pointerOverTimeline=true);
+tl.addEventListener('mouseleave', ()=>pointerOverTimeline=false);
 window.addEventListener('resize', ()=>{
   fitPxPerSec = duration? tl.getBoundingClientRect().width/duration : fitPxPerSec;
   layoutWheelCanvas(); drawWheel(strips.find(s=>s.id===selectedId)||null);
@@ -368,7 +417,7 @@ function drawTimeline(){
       const x1 = timeToX(s.start), x2 = timeToX(s.end);
       if(x2<0 || x1>w) return;
       const rx = Math.max(0,x1), rw = Math.max(2, x2-rx);
-      const isSel = s.id===selectedId;
+      const isSel = selectedIds.has(s.id);
       const isHover = hover.id===s.id;
 
       roundRectPath(tlCtx, rx, STRIP_Y, rw, STRIP_H, 8);
@@ -449,16 +498,28 @@ tl.addEventListener('mousedown', e=>{
   }
   const hit = hitStrip(x);
   if(hit){
+    // support ctrl/shift to multi-toggle selection
+    if(e.ctrlKey||e.shiftKey){
+      if(selectedIds.has(hit.strip.id)){
+        selectedIds.delete(hit.strip.id);
+        if(selectedId===hit.strip.id) selectedId = [...selectedIds][0]||null;
+      } else { selectedIds.add(hit.strip.id); selectedId = hit.strip.id; }
+      copyBtn.disabled = dupBtn.disabled = deleteBtnTop.disabled = playStripBtn.disabled = selectedIds.size===0;
+      drawTimeline(); return;
+    }
     if(hit.part==='left'){
+      saveStateForUndo();
       const b = getBounds(hit.strip.id, hit.strip.start, hit.strip.end);
       drag={mode:'resize-l',id:hit.strip.id,bounds:b};
       select(hit.strip.id); return;
     }
     if(hit.part==='right'){
+      saveStateForUndo();
       const b = getBounds(hit.strip.id, hit.strip.start, hit.strip.end);
       drag={mode:'resize-r',id:hit.strip.id,bounds:b};
       select(hit.strip.id); return;
     }
+    saveStateForUndo();
     const b = getBounds(hit.strip.id, hit.strip.start, hit.strip.end);
     drag={mode:'move',id:hit.strip.id,origStart:hit.strip.start,origEnd:hit.strip.end,grabT:t,bounds:b};
     select(hit.strip.id); return;
@@ -468,6 +529,7 @@ tl.addEventListener('mousedown', e=>{
     return;
   }
   const id = nextId++;
+  saveStateForUndo();
   const bounds = getBounds(id, t, t);
   strips.push({id,start:t,end:t,theta:0,r:0});
   drag = {mode:'create', id, anchor:t, bounds};
@@ -609,8 +671,13 @@ document.getElementById('ctxPlay').addEventListener('click', ()=>{
 });
 document.getElementById('ctxDup').addEventListener('click', ()=>{ duplicateStrip(ctxTargetId); });
 document.getElementById('ctxDelete').addEventListener('click', ()=>{
+  saveStateForUndo();
   strips = strips.filter(s=>s.id!==ctxTargetId);
-  if(selectedId===ctxTargetId) select(null);
+  if(selectedIds.has(ctxTargetId)){
+    selectedIds.delete(ctxTargetId);
+    if(selectedId===ctxTargetId) selectedId = [...selectedIds][0]||null;
+  }
+  if(selectedIds.size===0) select(null);
   drawTimeline();
 });
 
@@ -624,13 +691,21 @@ const startInput=document.getElementById('startInput');
 const endInput=document.getElementById('endInput');
 
 function select(id){
-  selectedId=id;
-  const has = id!=null;
+  // id may be null or a number or an array of ids
+  if(Array.isArray(id)){
+    selectedIds = new Set(id);
+    selectedId = id.length? id[0] : null;
+  } else if(id==null){
+    selectedIds.clear(); selectedId = null;
+  } else {
+    selectedIds = new Set([id]); selectedId = id;
+  }
+  const has = selectedIds.size>0;
   copyBtn.disabled = dupBtn.disabled = deleteBtnTop.disabled = playStripBtn.disabled = !has;
   refreshPanel(); drawTimeline();
 }
 function refreshPanel(){
-  const s = strips.find(s=>s.id===selectedId);
+  const s = strips.find(s=>s.id===selectedId) || strips.find(s=>selectedIds.has(s.id));
   if(!s){ panelEmpty.style.display='block'; panelSelected.style.display='none'; drawWheel(null); return; }
   panelEmpty.style.display='none'; panelSelected.style.display='block';
   startInput.value=s.start.toFixed(2); endInput.value=s.end.toFixed(2);
@@ -659,7 +734,9 @@ document.getElementById('seekBtn').addEventListener('click', ()=>{
   const s=strips.find(s=>s.id===selectedId); if(s) video.currentTime=s.start;
 });
 function deleteSelected(){
-  strips = strips.filter(s=>s.id!==selectedId);
+  if(selectedIds.size===0) return;
+  saveStateForUndo();
+  strips = strips.filter(s=>!selectedIds.has(s.id));
   select(null); drawTimeline();
 }
 document.getElementById('deleteBtn').addEventListener('click', deleteSelected);
@@ -671,6 +748,7 @@ addStripBtn.addEventListener('click', ()=>{
     showToast('Can\u2019t add a strip here \u2014 the playhead is inside an existing strip.');
     return;
   }
+  saveStateForUndo();
   const id=nextId++;
   const b = getBounds(id, t, t);
   const end = Math.min(b.right, t+1.5);
@@ -680,7 +758,7 @@ addStripBtn.addEventListener('click', ()=>{
 });
 
 function copySelected(){
-  const s=strips.find(s=>s.id===selectedId); if(!s) return;
+  const s=strips.find(s=>s.id===selectedId) || strips.find(s=>selectedIds.has(s.id)); if(!s) return;
   clipboard={dur:s.end-s.start, theta:s.theta, r:s.r};
   pasteBtn.disabled=false;
 }
@@ -691,6 +769,7 @@ function pasteAtPlayhead(){
     showToast('Can\u2019t paste here \u2014 the playhead is inside an existing strip.');
     return;
   }
+  saveStateForUndo();
   const id=nextId++;
   const b = getBounds(id, t, t);
   const end = Math.min(b.right, t+clipboard.dur);
@@ -707,6 +786,7 @@ function duplicateStrip(id){
     showToast('No room to duplicate this strip \u2014 it\u2019s boxed in by neighbours.');
     return;
   }
+  saveStateForUndo();
   const end = Math.min(b.right, start+len);
   const newId = nextId++;
   strips.push({id:newId, start, end, theta:s.theta, r:s.r});
@@ -722,7 +802,14 @@ playStripBtn.addEventListener('click', ()=>{
 });
 
 document.addEventListener('keydown', e=>{
-  if(document.activeElement.tagName==='INPUT') return;
+  if(document.activeElement && document.activeElement.tagName==='INPUT') return;
+  // global undo/redo
+  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='z'){
+    e.preventDefault();
+    if(e.shiftKey) redo(); else undo();
+    return;
+  }
+
   if(!duration) return;
 
   if(e.key===' '){
@@ -742,12 +829,22 @@ document.addEventListener('keydown', e=>{
   if(e.key==='Home'){ e.preventDefault(); video.currentTime = 0; return; }
   if(e.key==='End'){ e.preventDefault(); video.currentTime = duration; return; }
 
-  if((e.key==='Delete'||e.key==='Backspace') && selectedId!=null){ deleteSelected(); }
+  if((e.key==='Delete'||e.key==='Backspace') && selectedIds.size>0){ deleteSelected(); }
   if(e.ctrlKey && e.key.toLowerCase()==='c'){ copySelected(); }
   if(e.ctrlKey && e.key.toLowerCase()==='v'){ pasteAtPlayhead(); }
-  if(e.ctrlKey && e.key.toLowerCase()==='d'){ e.preventDefault(); if(selectedId!=null) duplicateStrip(selectedId); }
+  if(e.ctrlKey && e.key.toLowerCase()==='d'){ e.preventDefault(); if(selectedIds.size>0) duplicateStrip([...selectedIds][0]); }
   if(e.key.toLowerCase()==='p' && !e.ctrlKey && selectedId!=null){ playStripBtn.click(); }
   if(e.key.toLowerCase()==='a' && !e.ctrlKey){ addStripBtn.click(); }
+});
+
+// Ctrl+A select all when pointer is over the timeline
+document.addEventListener('keydown', e=>{
+  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==='a' && pointerOverTimeline){
+    e.preventDefault();
+    if(strips.length===0) return;
+    saveStateForUndo();
+    select(strips.map(s=>s.id));
+  }
 });
 
 /* ============ resizable sidebar / wheel ============ */
@@ -865,6 +962,7 @@ importInput.addEventListener('change', e=>{
   const reader=new FileReader();
   reader.onload=()=>{
     try{
+      saveStateForUndo();
       const data=JSON.parse(reader.result);
       strips=(data.strips||[]).map(s=>({id:nextId++,start:s.start,end:s.end,theta:s.theta??0,r:s.r??0}));
       select(null); drawTimeline();
