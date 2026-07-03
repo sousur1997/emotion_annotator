@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="96" fill="#4453d8"/>
+  <g transform="translate(256,256)">
+    <circle r="170" fill="#ffffff" opacity="0.12"/>
+    <g stroke="#ffffff" stroke-width="3" opacity="0.55">
+      <circle r="170" fill="none"/>
+      <circle r="112" fill="none"/>
+      <circle r="54" fill="none"/>
+    </g>
+    <g opacity="0.9">
+      <path d="M0 0 L0 -170 A170 170 0 0 1 120.2 -120.2 Z" fill="#e8b923"/>
+      <path d="M0 0 L120.2 -120.2 A170 170 0 0 1 170 0 Z" fill="#5b9a4d"/>
+      <path d="M0 0 L170 0 A170 170 0 0 1 120.2 120.2 Z" fill="#3d84cf"/>
+      <path d="M0 0 L120.2 120.2 A170 170 0 0 1 0 170 Z" fill="#1fa6b8"/>
+      <path d="M0 0 L0 170 A170 170 0 0 1 -120.2 120.2 Z" fill="#5c6bc0"/>
+      <path d="M0 0 L-120.2 120.2 A170 170 0 0 1 -170 0 Z" fill="#9c46a8"/>
+      <path d="M0 0 L-170 0 A170 170 0 0 1 -120.2 -120.2 Z" fill="#d64545"/>
+      <path d="M0 0 L-120.2 -120.2 A170 170 0 0 1 0 -170 Z" fill="#e08324"/>
+    </g>
+    <circle r="34" fill="#ffffff"/>
+    <line x1="0" y1="0" x2="70" y2="-70" stroke="#20242c" stroke-width="8" stroke-linecap="round"/>
+    <circle cx="70" cy="-70" r="12" fill="#20242c"/>
+  </g>
+</svg>

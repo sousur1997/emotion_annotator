@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emotion Annotator</title>
+<meta name="theme-color" content="#4453d8">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <h1>EMOTION ANNOTATOR <span class="build-tag">build 2026-07-03h</span></h1>
+  <label class="filebtn">📂 Load media<input id="mediaInput" type="file" accept="video/*,audio/*"></label>
+  <div class="sep"></div>
+  <button id="addStripBtn" disabled title="Add strip at playhead (A)">➕ Add strip</button>
+  <button id="dupBtn" disabled title="Duplicate selected strip (Ctrl+D)">⧉ Duplicate</button>
+  <button id="copyBtn" disabled title="Copy selected strip (Ctrl+C)">📄 Copy</button>
+  <button id="pasteBtn" disabled title="Paste at playhead (Ctrl+V)">📋 Paste</button>
+  <button id="deleteBtnTop" disabled title="Delete selected strip (Del)">🗑 Delete</button>
+  <div class="sep"></div>
+  <button id="playStripBtn" disabled title="Play only the selected strip (P)">▶ Play strip</button>
+  <label class="chk"><input type="checkbox" id="loopChk"> Loop</label>
+  <div class="sep"></div>
+  <button id="exportBtn" disabled>⬇ Export JSON</button>
+  <label class="filebtn">⬆ Import JSON<input id="importInput" type="file" accept="application/json"></label>
+</header>
+
+<div class="layout">
+  <div class="main">
+    <div class="media-wrap">
+      <video id="video" controls></video>
+      <div class="empty-hint" id="emptyHint">
+        <div class="empty-icon">🎬</div>
+        <div class="empty-title">No media loaded</div>
+        <div class="empty-sub">Click "Load media" above to open a video or audio file</div>
+      </div>
+    </div>
+
+    <div class="resizer-h" id="resizerH" title="Drag to resize timeline height"></div>
+
+    <div class="timeline-toolbar">
+      <div class="tl-left">
+        <button id="zoomOutBtn" title="Zoom out">−</button>
+        <button id="zoomInBtn" title="Zoom in">+</button>
+        <button id="fitBtn" title="Fit whole track">Fit</button>
+        <input type="range" id="panSlider" min="0" max="1" step="0.001" value="0">
+      </div>
+      <div class="tl-right">
+        <label class="frame-jump">Frame <input type="number" id="frameInput" min="0" step="1" value="0"></label>
+        <span class="mono time" id="timeLabel">00:00.00 / 00:00.00</span>
+      </div>
+    </div>
+
+    <div class="timeline-wrap">
+      <canvas id="timeline" height="150"></canvas>
+      <div class="tl-hint">Click ruler/waveform = seek · drag empty track = new strip (snaps to neighbours) · drag strip = move · drag edge = resize · right-click strip = menu · wheel = zoom · shift+wheel = pan · Space = play/pause · ←/→ = step frame · Shift+←/→ = step 1s</div>
+    </div>
+  </div>
+
+  <div class="resizer" id="resizer" title="Drag to resize"></div>
+
+  <div class="sidebar">
+    <h2>Emotion Wheel</h2>
+    <div id="wheelWrap" class="wheel-wrap">
+      <img id="wheelImg" src="EmotionWheel_PNG.png" alt="Emotion wheel reference" draggable="false">
+      <canvas id="wheel"></canvas>
+    </div>
+
+    <div id="panelEmpty" class="empty-panel">Select a strip (or add one) to set its emotion. Click and drag inside the wheel — the angle is the emotion family, the distance from the centre is intensity. Word rings are guides only; the exact position is stored as a continuous value, not a fixed label.</div>
+
+    <div id="panelSelected" style="display:none;">
+      <div class="readout">
+        <div class="label" id="emoLabel">—</div>
+        <div class="breadcrumb" id="emoBreadcrumb"></div>
+        <div class="sub mono" id="emoSub">θ 0° · r 0.00</div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Start (s)</label><input id="startInput" type="number" step="0.01"></div>
+        <div class="field"><label>End (s)</label><input id="endInput" type="number" step="0.01"></div>
+      </div>
+      <div class="strip-actions">
+        <button id="seekBtn">⏱ Seek</button>
+        <button id="deleteBtn" class="danger">🗑 Delete</button>
+      </div>
+    </div>
+
+    <div class="legend" id="legend"></div>
+  </div>
+</div>
+
+<div id="ctxMenu" class="ctx-menu">
+  <div class="ctx-header">
+    <div class="ctx-emo" id="ctxEmoLabel">—</div>
+    <div class="ctx-breadcrumb" id="ctxEmoBreadcrumb"></div>
+  </div>
+  <button id="ctxPlay">▶ Play strip <span class="kbd">P</span></button>
+  <button id="ctxDup">⧉ Duplicate <span class="kbd">Ctrl+D</span></button>
+  <button id="ctxDelete" class="danger-item">🗑 Delete <span class="kbd">Del</span></button>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="app.js" defer></script>
+</body>
+</html>
