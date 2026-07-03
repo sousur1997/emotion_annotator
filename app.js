@@ -474,17 +474,22 @@ function niceStep(visSec){
 /* ============ timeline interaction ============ */
 let drag = null;
 
-tl.addEventListener('auxclick', e=>{ if(e.button===1) e.preventDefault(); });
-tl.addEventListener('mousedown', e=>{
-  if(!duration) return;
+// make timeline touch/pen friendly: prevent browser scrolling during interaction
+tl.style.touchAction = tl.style.touchAction || 'none';
 
+tl.addEventListener('auxclick', e=>{ if(e.button===1) e.preventDefault(); });
+
+// unify mouse + pointer handling so pen/touch interactions won't scroll the page
+function handleDown(e){
+  if(!duration) return;
+  // middle button pan
   if(e.button===1){
     e.preventDefault();
     drag = {mode:'pan', startX:e.clientX, startViewStart:viewStart};
     tl.style.cursor='grabbing';
     return;
   }
-  if(e.button!==0) return;
+  if(e.button!==0 && e.pointerType!=='touch') return;
 
   const {STRIP_Y, STRIP_H} = getLayout();
   const {x,y} = relPos(e);
@@ -534,9 +539,9 @@ tl.addEventListener('mousedown', e=>{
   strips.push({id,start:t,end:t,theta:0,r:0});
   drag = {mode:'create', id, anchor:t, bounds};
   select(id);
-});
+}
 
-window.addEventListener('mousemove', e=>{
+function handleMove(e){
   const {x,y} = relPos(e);
   if(drag && drag.mode==='pan'){
     const deltaX = e.clientX - drag.startX;
@@ -601,8 +606,9 @@ window.addEventListener('mousemove', e=>{
     s.end=b;
   }
   drawTimeline();
-});
-window.addEventListener('mouseup', ()=>{
+}
+
+function handleUp(e){
   if(drag && drag.mode==='create'){
     const s = strips.find(s=>s.id===drag.id);
     if(s && s.end-s.start<0.05){
@@ -615,7 +621,14 @@ window.addEventListener('mouseup', ()=>{
     }
   }
   drag=null; tl.style.cursor='crosshair'; refreshPanel(); drawTimeline();
-});
+}
+
+tl.addEventListener('mousedown', handleDown);
+tl.addEventListener('pointerdown', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); handleDown(e); });
+window.addEventListener('mousemove', handleMove);
+window.addEventListener('pointermove', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); handleMove(e); });
+window.addEventListener('mouseup', handleUp);
+window.addEventListener('pointerup', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); handleUp(e); });
 
 tl.addEventListener('wheel', e=>{
   if(!duration) return;
@@ -944,9 +957,13 @@ function setFromWheel(clientX,clientY){
   s.theta=theta; s.r=r;
   updateReadout(s); drawWheel(s); drawTimeline();
 }
+wheel.style.touchAction = wheel.style.touchAction || 'none';
 wheel.addEventListener('mousedown', e=>{ if(selectedId==null) return; wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
+wheel.addEventListener('pointerdown', e=>{ if(selectedId==null) return; if(e.pointerType!=='mouse') e.preventDefault(); wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
 window.addEventListener('mousemove', e=>{ if(wheelDragging) setFromWheel(e.clientX,e.clientY); });
+window.addEventListener('pointermove', e=>{ if(wheelDragging) setFromWheel(e.clientX,e.clientY); });
 window.addEventListener('mouseup', ()=>{ wheelDragging=false; });
+window.addEventListener('pointerup', ()=>{ wheelDragging=false; });
 
 layoutWheelCanvas();
 drawWheel(null);
