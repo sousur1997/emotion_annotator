@@ -102,6 +102,7 @@ let duration = 0;
 let strips = [];
 let selectedId = null;
 let selectedIds = new Set();
+let boxSelectMode = false;
 let nextId = 1;
 let clipboard = null;
 let stripPlaying = null;
@@ -196,6 +197,12 @@ video.addEventListener('loadedmetadata', ()=>{
   fitView();
   drawTimeline();
 });
+const playPauseBtn = document.getElementById('playPauseBtn');
+function syncPlayIcon(){ if(playPauseBtn) playPauseBtn.textContent = video.paused ? '▶' : '⏸'; }
+video.addEventListener('play', syncPlayIcon);
+video.addEventListener('pause', syncPlayIcon);
+video.addEventListener('ended', syncPlayIcon);
+
 video.addEventListener('timeupdate', ()=>{
   if(stripPlaying && video.currentTime >= stripPlaying.end){
     if(loopChk.checked){ video.currentTime = stripPlaying.start; }
@@ -212,6 +219,13 @@ frameInput.addEventListener('change', ()=>{
   video.currentTime = f/FPS;
   frameInput.value = f;
 });
+
+// transport button wiring
+playPauseBtn.addEventListener('click', ()=>{ if(video.paused) video.play(); else video.pause(); });
+document.getElementById('firstFrameBtn').addEventListener('click', ()=>{ video.pause(); stripPlaying=null; video.currentTime=0; });
+document.getElementById('prevFrameBtn').addEventListener('click', ()=>{ video.pause(); stripPlaying=null; video.currentTime=Math.max(0, video.currentTime-1/FPS); });
+document.getElementById('nextFrameBtn').addEventListener('click', ()=>{ video.pause(); stripPlaying=null; video.currentTime=Math.min(duration||0, video.currentTime+1/FPS); });
+document.getElementById('lastFrameBtn').addEventListener('click', ()=>{ video.pause(); stripPlaying=null; video.currentTime=duration||0; });
 function updateTimeLabel(){
   timeLabel.textContent = `${fmt(video.currentTime)} / ${fmt(duration||0)}`;
   drawTimeline();
@@ -280,6 +294,11 @@ panSlider.addEventListener('input', ()=>{
 document.getElementById('zoomInBtn').addEventListener('click', ()=>zoomAt(tl.clientWidth/2, 1.5));
 document.getElementById('zoomOutBtn').addEventListener('click', ()=>zoomAt(tl.clientWidth/2, 1/1.5));
 document.getElementById('fitBtn').addEventListener('click', ()=>{ fitView(); drawTimeline(); });
+const boxSelectBtn = document.getElementById('boxSelectBtn');
+boxSelectBtn.addEventListener('click', ()=>{
+  boxSelectMode = !boxSelectMode;
+  boxSelectBtn.classList.toggle('active', boxSelectMode);
+});
 
 function zoomAt(x, factor){
   if(!duration) return;
@@ -413,11 +432,19 @@ function drawTimeline(){
     tlCtx.fillStyle='rgba(68,83,216,0.06)';
     tlCtx.fillRect(0,0,w,RULER_H+WAVE_H);
 
+    let boxT0=null, boxT1=null;
+    if(drag && drag.mode==='boxselect'){
+      const curT = drag.currentT ?? drag.anchorT;
+      boxT0 = Math.min(drag.anchorT, curT);
+      boxT1 = Math.max(drag.anchorT, curT);
+    }
+
     strips.forEach(s=>{
       const x1 = timeToX(s.start), x2 = timeToX(s.end);
       if(x2<0 || x1>w) return;
       const rx = Math.max(0,x1), rw = Math.max(2, x2-rx);
-      const isSel = selectedIds.has(s.id);
+      const inBox = boxT0!=null && s.end>boxT0 && s.start<boxT1;
+      const isSel = selectedIds.has(s.id) || inBox;
       const isHover = hover.id===s.id;
 
       roundRectPath(tlCtx, rx, STRIP_Y, rw, STRIP_H, 8);
@@ -432,6 +459,10 @@ function drawTimeline(){
       tlCtx.clip();
       tlCtx.fillStyle = coreOf(s.theta).color;
       tlCtx.fillRect(rx, STRIP_Y, 4, STRIP_H);
+      if(inBox && !selectedIds.has(s.id)){
+        tlCtx.fillStyle='rgba(68,83,216,0.18)';
+        tlCtx.fillRect(rx, STRIP_Y, rw, STRIP_H);
+      }
       tlCtx.restore();
 
       if(isHover && hover.part==='left'){
@@ -455,6 +486,16 @@ function drawTimeline(){
       }
     });
 
+    if(boxT0!=null){
+      const bx1 = timeToX(boxT0), bx2 = timeToX(boxT1);
+      tlCtx.fillStyle = 'rgba(68,83,216,0.12)';
+      tlCtx.fillRect(bx1, 2, Math.max(1,bx2-bx1), h-4);
+      tlCtx.strokeStyle = '#4453d8'; tlCtx.lineWidth = 1.4;
+      tlCtx.setLineDash([4,3]);
+      tlCtx.strokeRect(bx1, 2, Math.max(1,bx2-bx1), h-4);
+      tlCtx.setLineDash([]);
+    }
+
     const px = timeToX(video.currentTime);
     if(px>=0 && px<=w){
       tlCtx.strokeStyle = '#e0433f'; tlCtx.lineWidth = 1.5;
@@ -474,6 +515,55 @@ function niceStep(visSec){
 /* ============ timeline interaction ============ */
 let drag = null;
 
+/* pinch-to-zoom / two-finger pan (touch only — mice never have 2 contact points) */
+const activeTouches = new Map(); // pointerId -> {x,y}
+let pinchStartDist = null, pinchStartPxPerSec = null, pinchStartMidTime = null;
+
+function touchMidAndDist(){
+  const pts = [...activeTouches.values()];
+  const dx = pts[0].x - pts[1].x, dy = pts[0].y - pts[1].y;
+  const dist = Math.sqrt(dx*dx + dy*dy);
+  const midX = (pts[0].x + pts[1].x)/2;
+  return {dist, midX};
+}
+tl.addEventListener('pointerdown', e=>{
+  if(e.pointerType!=='touch') return;
+  activeTouches.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if(activeTouches.size===2){
+    // a second finger arrived — cancel whatever single-finger drag/long-press was in progress
+    drag = null;
+    cancelLongPressWatch();
+    const {dist, midX} = touchMidAndDist();
+    pinchStartDist = dist;
+    pinchStartPxPerSec = pxPerSec;
+    const rect = tl.getBoundingClientRect();
+    pinchStartMidTime = xToTime(midX - rect.left);
+  }
+});
+window.addEventListener('pointermove', e=>{
+  if(e.pointerType!=='touch' || !activeTouches.has(e.pointerId)) return;
+  activeTouches.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if(activeTouches.size===2 && pinchStartDist!=null){
+    e.preventDefault();
+    const {dist, midX} = touchMidAndDist();
+    const scale = dist / Math.max(1, pinchStartDist);
+    pxPerSec = Math.max(fitPxPerSec, Math.min(4000, pinchStartPxPerSec * scale));
+    const rect = tl.getBoundingClientRect();
+    const midT = xToTime(midX - rect.left);
+    // keep the point under the fingers fixed (combined pinch-zoom + two-finger pan)
+    viewStart += (pinchStartMidTime - midT);
+    clampView();
+    drawTimeline();
+  }
+});
+function endTouch(e){
+  if(e.pointerType!=='touch') return;
+  activeTouches.delete(e.pointerId);
+  if(activeTouches.size<2){ pinchStartDist=null; pinchStartPxPerSec=null; pinchStartMidTime=null; }
+}
+window.addEventListener('pointerup', endTouch);
+window.addEventListener('pointercancel', endTouch);
+
 // make timeline touch/pen friendly: prevent browser scrolling during interaction
 tl.style.touchAction = tl.style.touchAction || 'none';
 
@@ -482,18 +572,25 @@ tl.addEventListener('auxclick', e=>{ if(e.button===1) e.preventDefault(); });
 // unify mouse + pointer handling so pen/touch interactions won't scroll the page
 function handleDown(e){
   if(!duration) return;
-  // middle button pan
+  // middle button = pan
   if(e.button===1){
     e.preventDefault();
     drag = {mode:'pan', startX:e.clientX, startViewStart:viewStart};
     tl.style.cursor='grabbing';
     return;
   }
-  if(e.pointerType==='mouse' && e.button!==0) return;
+  // block right-click and any non-primary button from creating strips
+  if(e.button !== 0 && e.button !== undefined) return;
 
   const {STRIP_Y, STRIP_H} = getLayout();
   const {x,y} = relPos(e);
   const t = xToTime(x);
+
+  if(boxSelectMode || (e.shiftKey && !e.ctrlKey)){
+    drag = {mode:'boxselect', anchorX:x, anchorT:t, currentX:x, currentT:t};
+    drawTimeline();
+    return;
+  }
 
   if(y < STRIP_Y-2 || y > STRIP_Y+STRIP_H+2){
     drag = {mode:'scrub'};
@@ -501,10 +598,11 @@ function handleDown(e){
     drawTimeline();
     return;
   }
+
   const hit = hitStrip(x);
   if(hit){
-    // support ctrl/shift to multi-toggle selection
-    if(e.ctrlKey||e.shiftKey){
+    // ctrl-click = toggle single strip in/out of selection
+    if(e.ctrlKey){
       if(selectedIds.has(hit.strip.id)){
         selectedIds.delete(hit.strip.id);
         if(selectedId===hit.strip.id) selectedId = [...selectedIds][0]||null;
@@ -525,12 +623,32 @@ function handleDown(e){
       select(hit.strip.id); return;
     }
     saveStateForUndo();
-    const b = getBounds(hit.strip.id, hit.strip.start, hit.strip.end);
-    drag={mode:'move',id:hit.strip.id,origStart:hit.strip.start,origEnd:hit.strip.end,grabT:t,bounds:b};
-    select(hit.strip.id); return;
+    // multi-selection move: drag the whole group
+    if(selectedIds.size > 1 && selectedIds.has(hit.strip.id)){
+      const origPositions = {};
+      [...selectedIds].forEach(id=>{
+        const ss = strips.find(s=>s.id===id);
+        if(ss) origPositions[id] = {start:ss.start, end:ss.end};
+      });
+      drag={mode:'multimove', ids:[...selectedIds], origPositions, grabT:t};
+    } else {
+      const b = getBounds(hit.strip.id, hit.strip.start, hit.strip.end);
+      drag={mode:'move',id:hit.strip.id,origStart:hit.strip.start,origEnd:hit.strip.end,grabT:t,bounds:b};
+      select(hit.strip.id);
+    }
+    return;
   }
+
+  // empty space click/tap — deselect first, create strip on second click
+  if(selectedIds.size > 0){
+    selectedIds.clear(); selectedId=null;
+    copyBtn.disabled = dupBtn.disabled = deleteBtnTop.disabled = playStripBtn.disabled = true;
+    refreshPanel(); drawTimeline();
+    return;
+  }
+
   if(strictlyInsideAnother(t, null)){
-    showToast('Can\u2019t start a strip here \u2014 it overlaps an existing strip.');
+    showToast('Can’t start a strip here — it overlaps an existing strip.');
     return;
   }
   const id = nextId++;
@@ -547,6 +665,12 @@ function handleMove(e){
     const deltaX = e.clientX - drag.startX;
     viewStart = drag.startViewStart - deltaX/pxPerSec;
     clampView();
+    drawTimeline();
+    return;
+  }
+  if(drag && drag.mode==='boxselect'){
+    drag.currentX = x;
+    drag.currentT = xToTime(x);
     drawTimeline();
     return;
   }
@@ -571,6 +695,33 @@ function handleMove(e){
   }
   const t = xToTime(x);
   if(drag.mode==='scrub'){ video.currentTime = t; return; }
+
+  // multimove has no drag.id — handle it before the single-strip lookup
+  if(drag.mode==='multimove'){
+    tl.style.cursor='grabbing';
+    let delta = t - drag.grabT;
+    const selSet = new Set(drag.ids);
+    drag.ids.forEach(id=>{
+      const orig = drag.origPositions[id]; if(!orig) return;
+      let leftBound = 0, rightBound = duration;
+      strips.forEach(s=>{
+        if(selSet.has(s.id)) return;
+        if(s.end <= orig.start + 1e-9 && s.end > leftBound) leftBound = s.end;
+        if(s.start >= orig.end - 1e-9 && s.start < rightBound) rightBound = s.start;
+      });
+      delta = Math.max(leftBound - orig.start, Math.min(rightBound - orig.end, delta));
+    });
+    drag.ids.forEach(id=>{
+      const ss = strips.find(s=>s.id===id);
+      const orig = drag.origPositions[id];
+      if(!ss || !orig) return;
+      ss.start = orig.start + delta;
+      ss.end   = orig.end   + delta;
+    });
+    drawTimeline();
+    return;
+  }
+
   const s = strips.find(s=>s.id===drag.id);
   if(!s) return;
   const cands = snapCandidates(drag.id);
@@ -595,11 +746,15 @@ function handleMove(e){
     ns = Math.max(drag.bounds.left, Math.min(drag.bounds.right-len, ns));
     s.start=ns; s.end=ns+len;
   } else if(drag.mode==='resize-l'){
+    const s = strips.find(s=>s.id===drag.id); if(!s) return;
+    const cands = snapCandidates(drag.id);
     let a = Math.max(drag.bounds.left, Math.min(t, s.end-0.05));
     a = trySnap(a, cands);
     a = Math.max(drag.bounds.left, Math.min(a, s.end-0.05));
     s.start=a;
   } else if(drag.mode==='resize-r'){
+    const s = strips.find(s=>s.id===drag.id); if(!s) return;
+    const cands = snapCandidates(drag.id);
     let b = Math.min(drag.bounds.right, Math.max(t, s.start+0.05));
     b = trySnap(b, cands);
     b = Math.min(drag.bounds.right, Math.max(b, s.start+0.05));
@@ -609,6 +764,28 @@ function handleMove(e){
 }
 
 function handleUp(e){
+  if(drag && drag.mode==='boxselect'){
+    const movedPx = Math.abs((drag.currentX ?? drag.anchorX) - drag.anchorX);
+    if(movedPx < 4){
+      const hit = hitStrip(drag.anchorX);
+      if(hit){
+        if(selectedIds.has(hit.strip.id)) selectedIds.delete(hit.strip.id);
+        else selectedIds.add(hit.strip.id);
+        selectedId = [...selectedIds][selectedIds.size-1] ?? null;
+      } else if(!boxSelectMode){
+        selectedIds.clear(); selectedId = null;
+      }
+    } else {
+      const t0 = Math.min(drag.anchorT, drag.currentT), t1 = Math.max(drag.anchorT, drag.currentT);
+      const matched = strips.filter(s=> s.end>t0 && s.start<t1);
+      matched.forEach(s=>selectedIds.add(s.id));
+      if(matched.length) selectedId = matched[matched.length-1].id;
+    }
+    copyBtn.disabled = dupBtn.disabled = deleteBtnTop.disabled = playStripBtn.disabled = selectedIds.size===0;
+    drag = null; tl.style.cursor='crosshair';
+    refreshPanel(); drawTimeline();
+    return;
+  }
   if(drag && drag.mode==='create'){
     const s = strips.find(s=>s.id===drag.id);
     if(s && s.end-s.start<0.05){
@@ -654,17 +831,17 @@ function cancelLongPressWatch(moveEvent){
 }
 
 tl.addEventListener('pointerdown', e=>{
-  if(e.pointerType!=='mouse'){
-    e.preventDefault();
-    try{ tl.setPointerCapture(e.pointerId); }catch(err){}
-    startLongPressWatch(e);
-  }
+  if(e.pointerType==='mouse') return;
+  if(e.pointerType==='touch' && activeTouches.size>=2) return;
+  e.preventDefault();
+  try{ tl.setPointerCapture(e.pointerId); }catch(err){}
+  startLongPressWatch(e);
   handleDown(e);
 });
 window.addEventListener('mousemove', handleMove);
-window.addEventListener('pointermove', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); cancelLongPressWatch(e); handleMove(e); });
+window.addEventListener('pointermove', e=>{ if(e.pointerType==='mouse') return; e.preventDefault(); cancelLongPressWatch(e); handleMove(e); });
 window.addEventListener('mouseup', handleUp);
-window.addEventListener('pointerup', e=>{ cancelLongPressWatch(); if(e.pointerType!=='mouse'){ e.preventDefault(); try{ tl.releasePointerCapture(e.pointerId); }catch(err){} } handleUp(e); });
+window.addEventListener('pointerup', e=>{ if(e.pointerType==='mouse') return; cancelLongPressWatch(); e.preventDefault(); try{ tl.releasePointerCapture(e.pointerId); }catch(err){} handleUp(e); });
 
 tl.addEventListener('wheel', e=>{
   if(!duration) return;
@@ -876,6 +1053,12 @@ document.addEventListener('keydown', e=>{
     return;
   }
   if(e.key==='Home'){ e.preventDefault(); video.currentTime = 0; return; }
+  if(e.key==='Escape'){
+    selectedIds.clear(); selectedId=null;
+    if(boxSelectMode){ boxSelectMode=false; boxSelectBtn.classList.remove('active'); }
+    drag=null; refreshPanel(); drawTimeline();
+    return;
+  }
   if(e.key==='End'){ e.preventDefault(); video.currentTime = duration; return; }
 
   if((e.key==='Delete'||e.key==='Backspace') && selectedIds.size>0){ deleteSelected(); }
@@ -909,11 +1092,11 @@ function sidebarResizeMove(e){
 }
 function sidebarResizeEnd(){ if(resizingSidebar){ resizingSidebar=false; document.body.style.cursor=''; } }
 resizer.addEventListener('mousedown', sidebarResizeStart);
-resizer.addEventListener('pointerdown', e=>{ if(e.pointerType!=='mouse'){ try{ resizer.setPointerCapture(e.pointerId); }catch(err){} } sidebarResizeStart(e); });
+resizer.addEventListener('pointerdown', e=>{ if(e.pointerType==='mouse') return; try{ resizer.setPointerCapture(e.pointerId); }catch(err){} sidebarResizeStart(e); });
 window.addEventListener('mousemove', sidebarResizeMove);
-window.addEventListener('pointermove', e=>{ if(resizingSidebar && e.pointerType!=='mouse') e.preventDefault(); sidebarResizeMove(e); });
+window.addEventListener('pointermove', e=>{ if(e.pointerType==='mouse') return; if(resizingSidebar) e.preventDefault(); sidebarResizeMove(e); });
 window.addEventListener('mouseup', sidebarResizeEnd);
-window.addEventListener('pointerup', e=>{ if(e.pointerType!=='mouse'){ try{ resizer.releasePointerCapture(e.pointerId); }catch(err){} } sidebarResizeEnd(); });
+window.addEventListener('pointerup', e=>{ if(e.pointerType==='mouse') return; try{ resizer.releasePointerCapture(e.pointerId); }catch(err){} sidebarResizeEnd(); });
 
 /* ============ resizable media area / timeline split ============ */
 const mediaWrapEl = document.querySelector('.media-wrap');
@@ -939,11 +1122,11 @@ function mediaResizeMove(e){
 }
 function mediaResizeEnd(){ if(resizingMedia){ resizingMedia=false; document.body.style.cursor=''; } }
 resizerH.addEventListener('mousedown', mediaResizeStart);
-resizerH.addEventListener('pointerdown', e=>{ if(e.pointerType!=='mouse'){ try{ resizerH.setPointerCapture(e.pointerId); }catch(err){} } mediaResizeStart(e); });
+resizerH.addEventListener('pointerdown', e=>{ if(e.pointerType==='mouse') return; try{ resizerH.setPointerCapture(e.pointerId); }catch(err){} mediaResizeStart(e); });
 window.addEventListener('mousemove', mediaResizeMove);
-window.addEventListener('pointermove', e=>{ if(resizingMedia && e.pointerType!=='mouse') e.preventDefault(); mediaResizeMove(e); });
+window.addEventListener('pointermove', e=>{ if(e.pointerType==='mouse') return; if(resizingMedia) e.preventDefault(); mediaResizeMove(e); });
 window.addEventListener('mouseup', mediaResizeEnd);
-window.addEventListener('pointerup', e=>{ if(e.pointerType!=='mouse'){ try{ resizerH.releasePointerCapture(e.pointerId); }catch(err){} } mediaResizeEnd(); });
+window.addEventListener('pointerup', e=>{ if(e.pointerType==='mouse') return; try{ resizerH.releasePointerCapture(e.pointerId); }catch(err){} mediaResizeEnd(); });
 
 /* ============ emotion wheel: reference image + thin overlay ============ */
 const wheelWrap=document.getElementById('wheelWrap');
@@ -1003,11 +1186,11 @@ function setFromWheel(clientX,clientY){
 }
 wheel.style.touchAction = wheel.style.touchAction || 'none';
 wheel.addEventListener('mousedown', e=>{ if(selectedId==null) return; wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
-wheel.addEventListener('pointerdown', e=>{ if(selectedId==null) return; if(e.pointerType!=='mouse'){ e.preventDefault(); try{ wheel.setPointerCapture(e.pointerId); }catch(err){} } wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
+wheel.addEventListener('pointerdown', e=>{ if(e.pointerType==='mouse' || selectedId==null) return; e.preventDefault(); try{ wheel.setPointerCapture(e.pointerId); }catch(err){} wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
 window.addEventListener('mousemove', e=>{ if(wheelDragging) setFromWheel(e.clientX,e.clientY); });
-window.addEventListener('pointermove', e=>{ if(wheelDragging){ if(e.pointerType!=='mouse') e.preventDefault(); setFromWheel(e.clientX,e.clientY); } });
+window.addEventListener('pointermove', e=>{ if(e.pointerType==='mouse' || !wheelDragging) return; e.preventDefault(); setFromWheel(e.clientX,e.clientY); });
 window.addEventListener('mouseup', ()=>{ wheelDragging=false; });
-window.addEventListener('pointerup', e=>{ wheelDragging=false; if(e.pointerType!=='mouse'){ try{ wheel.releasePointerCapture(e.pointerId); }catch(err){} } });
+window.addEventListener('pointerup', e=>{ if(e.pointerType==='mouse') return; wheelDragging=false; try{ wheel.releasePointerCapture(e.pointerId); }catch(err){} });
 
 layoutWheelCanvas();
 drawWheel(null);
