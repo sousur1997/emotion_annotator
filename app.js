@@ -489,7 +489,7 @@ function handleDown(e){
     tl.style.cursor='grabbing';
     return;
   }
-  if(e.button!==0 && e.pointerType!=='touch') return;
+  if(e.pointerType==='mouse' && e.button!==0) return;
 
   const {STRIP_Y, STRIP_H} = getLayout();
   const {x,y} = relPos(e);
@@ -624,11 +624,47 @@ function handleUp(e){
 }
 
 tl.addEventListener('mousedown', handleDown);
-tl.addEventListener('pointerdown', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); handleDown(e); });
+/* long-press = context menu, for stylus/touch users with no barrel button or right-click */
+let longPressTimer = null;
+let longPressStart = null;
+function startLongPressWatch(e){
+  cancelLongPressWatch();
+  const {STRIP_Y, STRIP_H} = getLayout();
+  const {x,y} = relPos(e);
+  if(y<STRIP_Y-2||y>STRIP_Y+STRIP_H+2) return;
+  const hit = hitStrip(x);
+  if(!hit || hit.part!=='move') return; // only long-press the body, not while resizing an edge
+  longPressStart = {x:e.clientX, y:e.clientY, id:hit.strip.id};
+  longPressTimer = setTimeout(()=>{
+    if(!longPressStart) return;
+    select(longPressStart.id);
+    openContextMenu(longPressStart.id, longPressStart.x, longPressStart.y);
+    drag = null; // don't also start a move-drag once the menu opens
+    longPressStart = null;
+  }, 500);
+}
+function cancelLongPressWatch(moveEvent){
+  if(moveEvent && longPressStart){
+    const dx = moveEvent.clientX-longPressStart.x, dy = moveEvent.clientY-longPressStart.y;
+    if(Math.sqrt(dx*dx+dy*dy) < 10) return; // small jitter is fine, don't cancel yet
+  }
+  clearTimeout(longPressTimer);
+  longPressTimer = null;
+  longPressStart = null;
+}
+
+tl.addEventListener('pointerdown', e=>{
+  if(e.pointerType!=='mouse'){
+    e.preventDefault();
+    try{ tl.setPointerCapture(e.pointerId); }catch(err){}
+    startLongPressWatch(e);
+  }
+  handleDown(e);
+});
 window.addEventListener('mousemove', handleMove);
-window.addEventListener('pointermove', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); handleMove(e); });
+window.addEventListener('pointermove', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); cancelLongPressWatch(e); handleMove(e); });
 window.addEventListener('mouseup', handleUp);
-window.addEventListener('pointerup', e=>{ if(e.pointerType!=='mouse') e.preventDefault(); handleUp(e); });
+window.addEventListener('pointerup', e=>{ cancelLongPressWatch(); if(e.pointerType!=='mouse'){ e.preventDefault(); try{ tl.releasePointerCapture(e.pointerId); }catch(err){} } handleUp(e); });
 
 tl.addEventListener('wheel', e=>{
   if(!duration) return;
@@ -863,31 +899,35 @@ document.addEventListener('keydown', e=>{
 /* ============ resizable sidebar / wheel ============ */
 const resizer = document.getElementById('resizer');
 let resizingSidebar = false;
-resizer.addEventListener('mousedown', e=>{ resizingSidebar=true; document.body.style.cursor='col-resize'; e.preventDefault(); });
-window.addEventListener('mousemove', e=>{
+function sidebarResizeStart(e){ resizingSidebar=true; document.body.style.cursor='col-resize'; e.preventDefault(); }
+function sidebarResizeMove(e){
   if(!resizingSidebar) return;
   const newWidth = Math.max(260, Math.min(640, window.innerWidth - e.clientX));
   sidebarEl.style.width = newWidth+'px';
   layoutWheelCanvas();
   drawWheel(strips.find(s=>s.id===selectedId)||null);
-});
-window.addEventListener('mouseup', ()=>{
-  if(resizingSidebar){ resizingSidebar=false; document.body.style.cursor=''; }
-});
+}
+function sidebarResizeEnd(){ if(resizingSidebar){ resizingSidebar=false; document.body.style.cursor=''; } }
+resizer.addEventListener('mousedown', sidebarResizeStart);
+resizer.addEventListener('pointerdown', e=>{ if(e.pointerType!=='mouse'){ try{ resizer.setPointerCapture(e.pointerId); }catch(err){} } sidebarResizeStart(e); });
+window.addEventListener('mousemove', sidebarResizeMove);
+window.addEventListener('pointermove', e=>{ if(resizingSidebar && e.pointerType!=='mouse') e.preventDefault(); sidebarResizeMove(e); });
+window.addEventListener('mouseup', sidebarResizeEnd);
+window.addEventListener('pointerup', e=>{ if(e.pointerType!=='mouse'){ try{ resizer.releasePointerCapture(e.pointerId); }catch(err){} } sidebarResizeEnd(); });
 
 /* ============ resizable media area / timeline split ============ */
 const mediaWrapEl = document.querySelector('.media-wrap');
 const resizerH = document.getElementById('resizerH');
 let resizingMedia = false;
 let mediaResizeStartY = 0, mediaResizeStartH = 0;
-resizerH.addEventListener('mousedown', e=>{
+function mediaResizeStart(e){
   resizingMedia = true;
   mediaResizeStartY = e.clientY;
   mediaResizeStartH = mediaWrapEl.getBoundingClientRect().height;
   document.body.style.cursor='row-resize';
   e.preventDefault();
-});
-window.addEventListener('mousemove', e=>{
+}
+function mediaResizeMove(e){
   if(!resizingMedia) return;
   const delta = e.clientY - mediaResizeStartY; // drag down = taller media area
   const mainH = document.querySelector('.main').getBoundingClientRect().height;
@@ -896,10 +936,14 @@ window.addEventListener('mousemove', e=>{
   const newH = Math.max(minMedia, Math.min(maxMedia, mediaResizeStartH + delta));
   mediaWrapEl.style.height = newH+'px';
   drawTimeline();
-});
-window.addEventListener('mouseup', ()=>{
-  if(resizingMedia){ resizingMedia=false; document.body.style.cursor=''; }
-});
+}
+function mediaResizeEnd(){ if(resizingMedia){ resizingMedia=false; document.body.style.cursor=''; } }
+resizerH.addEventListener('mousedown', mediaResizeStart);
+resizerH.addEventListener('pointerdown', e=>{ if(e.pointerType!=='mouse'){ try{ resizerH.setPointerCapture(e.pointerId); }catch(err){} } mediaResizeStart(e); });
+window.addEventListener('mousemove', mediaResizeMove);
+window.addEventListener('pointermove', e=>{ if(resizingMedia && e.pointerType!=='mouse') e.preventDefault(); mediaResizeMove(e); });
+window.addEventListener('mouseup', mediaResizeEnd);
+window.addEventListener('pointerup', e=>{ if(e.pointerType!=='mouse'){ try{ resizerH.releasePointerCapture(e.pointerId); }catch(err){} } mediaResizeEnd(); });
 
 /* ============ emotion wheel: reference image + thin overlay ============ */
 const wheelWrap=document.getElementById('wheelWrap');
@@ -959,11 +1003,11 @@ function setFromWheel(clientX,clientY){
 }
 wheel.style.touchAction = wheel.style.touchAction || 'none';
 wheel.addEventListener('mousedown', e=>{ if(selectedId==null) return; wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
-wheel.addEventListener('pointerdown', e=>{ if(selectedId==null) return; if(e.pointerType!=='mouse') e.preventDefault(); wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
+wheel.addEventListener('pointerdown', e=>{ if(selectedId==null) return; if(e.pointerType!=='mouse'){ e.preventDefault(); try{ wheel.setPointerCapture(e.pointerId); }catch(err){} } wheelDragging=true; setFromWheel(e.clientX,e.clientY); });
 window.addEventListener('mousemove', e=>{ if(wheelDragging) setFromWheel(e.clientX,e.clientY); });
-window.addEventListener('pointermove', e=>{ if(wheelDragging) setFromWheel(e.clientX,e.clientY); });
+window.addEventListener('pointermove', e=>{ if(wheelDragging){ if(e.pointerType!=='mouse') e.preventDefault(); setFromWheel(e.clientX,e.clientY); } });
 window.addEventListener('mouseup', ()=>{ wheelDragging=false; });
-window.addEventListener('pointerup', ()=>{ wheelDragging=false; });
+window.addEventListener('pointerup', e=>{ wheelDragging=false; if(e.pointerType!=='mouse'){ try{ wheel.releasePointerCapture(e.pointerId); }catch(err){} } });
 
 layoutWheelCanvas();
 drawWheel(null);
