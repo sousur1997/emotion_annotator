@@ -1,6 +1,6 @@
 // Bump CACHE whenever app.js / index.html / style.css change, so old
 // clients pick up the new files instead of serving a stale cached copy.
-const CACHE = 'emotion-annotator-v7';
+const CACHE = 'emotion-annotator-v12';
 const ASSETS = [
   './',
   './index.html',
