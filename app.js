@@ -256,16 +256,107 @@ document.getElementById('nextFrameBtn').addEventListener('click', () => { video.
 document.getElementById('lastFrameBtn').addEventListener('click', () => { video.pause(); stripPlaying = null; video.currentTime = duration || 0; });
 function updateTimeLabel() {
   timeLabel.textContent = `${fmt(video.currentTime)} / ${fmt(duration || 0)}`;
-  drawTimeline();
+  requestDraw();
 }
 function fmt(t) {
   const m = Math.floor(t / 60), s = (t % 60);
   return String(m).padStart(2, '0') + ':' + s.toFixed(2).padStart(5, '0');
 }
-function raf() { if (video && !video.paused) { drawTimeline(); } requestAnimationFrame(raf); }
+function raf() { if (video && !video.paused) { compositeFrame(); } requestAnimationFrame(raf); }
 requestAnimationFrame(raf);
 
 /* ============ waveform decode ============ */
+// Computes the [min,max] average-channel value for one bucket of samples.
+// Pulled out as its own function so the sync and chunked code paths below
+// share the exact same math (guarantees identical output either way).
+function computePeakBucket(chans, start, end) {
+  const nc = chans.length;
+  let mn = 1, mx = -1;
+  for (let j = start; j < end; j++) {
+    let v = 0;
+    for (let c = 0; c < nc; c++) v += chans[c][j];
+    v /= nc;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  if (end <= start) { mn = 0; mx = 0; }
+  return [mn, mx];
+}
+
+// Original single-pass computation. Kept as a guaranteed-correct fallback:
+// if anything about the chunked/async path below misbehaves, we still
+// produce a full, correct waveform synchronously rather than none at all.
+function computePeaksSync(chans, len, N, bucket, peaks) {
+  for (let i = 0; i < N; i++) {
+    const start = i * bucket, end = Math.min(len, start + bucket);
+    const [mn, mx] = computePeakBucket(chans, start, end);
+    peaks[i * 2] = mn; peaks[i * 2 + 1] = mx;
+  }
+}
+
+// Same computation as computePeaksSync, but sliced across idle/animation
+// callbacks so a long file doesn't freeze the tab for several seconds on
+// load. Resolves once every bucket has been filled in; rejects (never
+// leaving partial/garbage data behind) if a slice throws, so the caller can
+// fall back to the synchronous pass.
+function computePeaksChunked(chans, len, N, bucket, peaks) {
+  return new Promise((resolve, reject) => {
+    const CHUNK = 500; // buckets processed per slice — small enough to stay responsive
+    const schedule = window.requestIdleCallback || window.requestAnimationFrame || (fn => setTimeout(fn, 0));
+    let i = 0;
+    function step() {
+      try {
+        const end = Math.min(N, i + CHUNK);
+        for (; i < end; i++) {
+          const start = i * bucket, bEnd = Math.min(len, start + bucket);
+          const [mn, mx] = computePeakBucket(chans, start, bEnd);
+          peaks[i * 2] = mn; peaks[i * 2 + 1] = mx;
+        }
+        if (i < N) schedule(step);
+        else resolve();
+      } catch (err) { reject(err); }
+    }
+    step();
+  });
+}
+
+// Builds a mip-map of coarser levels on top of a finest-resolution peaks
+// array, by pairwise-reducing each level into the next (min-of-mins,
+// max-of-maxes). This never re-scans the raw audio samples, so it's fast
+// (O(N) total across all levels) regardless of how fine the base level is.
+// Levels are ordered finest (index 0) -> coarsest (last index).
+function buildMipLevels(basePeaks, N0, dur) {
+  const levels = [{ peaks: basePeaks, n: N0, bucketDur: dur / N0 }];
+  let peaks = basePeaks, n = N0;
+  while (n > 1000) {
+    const nextN = Math.ceil(n / 2);
+    const next = new Float32Array(nextN * 2);
+    for (let i = 0; i < nextN; i++) {
+      const i0 = i * 2, i1 = i * 2 + 1;
+      const a0 = peaks[i0 * 2], b0 = peaks[i0 * 2 + 1];
+      let a1 = a0, b1 = b0;
+      if (i1 < n) { a1 = peaks[i1 * 2]; b1 = peaks[i1 * 2 + 1]; }
+      next[i * 2] = Math.min(a0, a1);
+      next[i * 2 + 1] = Math.max(b0, b1);
+    }
+    levels.push({ peaks: next, n: nextN, bucketDur: dur / nextN });
+    peaks = next; n = nextN;
+  }
+  return levels;
+}
+
+// Picks the coarsest mip level that's still at least as fine as one screen
+// pixel (bucketDur <= secPerPixel). That keeps the per-pixel lookup at ~1
+// bucket no matter how far zoomed out you are. If even the finest level is
+// coarser than a pixel (very deep zoom-in), falls back to the finest level.
+function pickMipLevel(levels, secPerPixel) {
+  let best = levels[0];
+  for (const lvl of levels) {
+    if (lvl.bucketDur <= secPerPixel) best = lvl; else break;
+  }
+  return best;
+}
+
 async function decodeWaveform(file) {
   try {
     const buf = await file.arrayBuffer();
@@ -274,21 +365,28 @@ async function decodeWaveform(file) {
     const chans = [];
     for (let c = 0; c < audioBuffer.numberOfChannels; c++) chans.push(audioBuffer.getChannelData(c));
     const len = chans[0].length;
-    const N = 6000;
-    const bucket = Math.max(1, Math.floor(len / N));
-    const peaks = new Float32Array(N * 2);
-    for (let i = 0; i < N; i++) {
-      const start = i * bucket, end = Math.min(len, start + bucket);
-      let mn = 1, mx = -1;
-      for (let j = start; j < end; j++) {
-        let v = 0; for (let c = 0; c < chans.length; c++) v += chans[c][j];
-        v /= chans.length;
-        if (v < mn) mn = v; if (v > mx) mx = v;
-      }
-      if (end <= start) { mn = 0; mx = 0; }
-      peaks[i * 2] = mn; peaks[i * 2 + 1] = mx;
+    const dur = audioBuffer.duration;
+
+    // Finest level: aim for ~200 buckets/sec (5ms resolution — enough to
+    // see short pauses/silence clearly), floor of 6000 for short clips,
+    // capped so very long recordings don't blow up memory/compute.
+    const targetPerSec = 200;
+    const N0 = Math.max(6000, Math.min(400000, len, Math.round(dur * targetPerSec)));
+    const bucket = Math.max(1, Math.floor(len / N0));
+    const basePeaks = new Float32Array(N0 * 2);
+
+    try {
+      // Preferred path: chunked, keeps the UI responsive while decoding.
+      await computePeaksChunked(chans, len, N0, bucket, basePeaks);
+    } catch (chunkErr) {
+      // Fallback: identical math, run in one synchronous pass. Guarantees
+      // waveform generation still succeeds even if the chunked path fails
+      // for any reason (e.g. requestIdleCallback quirks).
+      computePeaksSync(chans, len, N0, bucket, basePeaks);
     }
-    waveform = { peaks, n: N, dur: audioBuffer.duration };
+
+    const levels = buildMipLevels(basePeaks, N0, dur);
+    waveform = { levels, dur };
     drawTimeline();
   } catch (err) { waveform = null; }
 }
@@ -317,7 +415,7 @@ panSlider.addEventListener('input', () => {
   const vd = visibleDur();
   const maxStart = Math.max(0, duration - vd);
   viewStart = parseFloat(panSlider.value) * maxStart;
-  drawTimeline();
+  requestDraw();
 });
 document.getElementById('zoomInBtn').addEventListener('click', () => zoomAt(tl.clientWidth / 2, 1.5));
 document.getElementById('zoomOutBtn').addEventListener('click', () => zoomAt(tl.clientWidth / 2, 1 / 1.5));
@@ -335,12 +433,22 @@ function zoomAt(x, factor) {
   viewStart = t - x / pxPerSec;
   clampView();
   updatePanSlider();
-  drawTimeline();
+  requestDraw();
 }
 
 /* ============ timeline canvas ============ */
 const tl = document.getElementById('timeline');
 const tlCtx = tl.getContext('2d');
+
+// Offscreen cache for the "static" part of the timeline (ruler, waveform,
+// strips, box-select). This is the expensive part to draw. We render it
+// into staticCanvas whenever the underlying data/view actually changes
+// (zoom, pan, resize, strip edits, waveform load), and on every animation
+// frame during playback we just blit this cached bitmap onto the visible
+// canvas and draw the playhead on top — instead of re-rendering the whole
+// waveform + every strip 60 times a second.
+const staticCanvas = document.createElement('canvas');
+const staticCtx = staticCanvas.getContext('2d');
 // track pointer inside timeline for Ctrl+A behavior (attach after element exists)
 tl.addEventListener('mouseenter', () => pointerOverTimeline = true);
 tl.addEventListener('mouseleave', () => pointerOverTimeline = false);
@@ -408,57 +516,71 @@ function strictlyInsideAnother(t, excludeId) {
   return strips.some(s => s.id !== excludeId && t > s.start + 1e-6 && t < s.end - 1e-6);
 }
 
-function drawTimeline() {
+// Renders the ruler, waveform, strips, and box-select overlay into the
+// offscreen staticCanvas. This is the expensive function — call it only
+// when something that affects the picture actually changed, not on every
+// animation frame.
+function renderStatic() {
   const dpr = window.devicePixelRatio || 1;
   const { RULER_H, WAVE_H, STRIP_Y, STRIP_H } = getLayout();
   const rect = tl.getBoundingClientRect();
   const w = rect.width, h = rect.height || 150;
+
+  // Keep both the visible canvas and the offscreen cache sized to match.
   tl.width = w * dpr; tl.height = h * dpr;
-  tlCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  tlCtx.clearRect(0, 0, w, h);
-  tlCtx.fillStyle = '#fbfbfc';
-  tlCtx.fillRect(0, 0, w, h);
+  if (staticCanvas.width !== tl.width || staticCanvas.height !== tl.height) {
+    staticCanvas.width = tl.width; staticCanvas.height = tl.height;
+  }
+  staticCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  staticCtx.clearRect(0, 0, w, h);
+  staticCtx.fillStyle = '#fbfbfc';
+  staticCtx.fillRect(0, 0, w, h);
 
   if (duration > 0) {
-    tlCtx.strokeStyle = '#e6e8ec';
-    tlCtx.fillStyle = '#8a90a0';
-    tlCtx.font = '10px Consolas, monospace';
+    staticCtx.strokeStyle = '#e6e8ec';
+    staticCtx.fillStyle = '#8a90a0';
+    staticCtx.font = '10px Consolas, monospace';
     const step = niceStep(visibleDur());
     const t0 = Math.floor(viewStart / step) * step;
     for (let t = t0; t <= viewStart + visibleDur() + step; t += step) {
       if (t < 0) continue;
       const x = timeToX(t);
-      tlCtx.beginPath(); tlCtx.moveTo(x, RULER_H); tlCtx.lineTo(x, h); tlCtx.stroke();
-      tlCtx.fillText(fmt(t), x + 3, 12);
+      staticCtx.beginPath(); staticCtx.moveTo(x, RULER_H); staticCtx.lineTo(x, h); staticCtx.stroke();
+      staticCtx.fillText(fmt(t), x + 3, 12);
     }
 
-    tlCtx.fillStyle = '#eef0f4';
-    tlCtx.fillRect(0, RULER_H, w, WAVE_H);
+    staticCtx.fillStyle = '#eef0f4';
+    staticCtx.fillRect(0, RULER_H, w, WAVE_H);
     const midY = RULER_H + WAVE_H / 2;
     if (waveform) {
-      tlCtx.strokeStyle = '#8a93d8';
-      tlCtx.beginPath();
+      const secPerPixel = 1 / pxPerSec;
+      const level = pickMipLevel(waveform.levels, secPerPixel);
+      // Level was chosen so bucketDur <= secPerPixel, so span is normally 1;
+      // the cap at 4 just guards against float rounding at the boundary —
+      // it never grows with zoom/duration the way the old flat lookup did.
+      const span = Math.min(4, Math.max(1, Math.round(secPerPixel / level.bucketDur)));
+      staticCtx.strokeStyle = '#8a93d8';
+      staticCtx.beginPath();
       for (let x = 0; x < w; x++) {
         const t = xToTime(x);
-        const bIdx = Math.floor((t / waveform.dur) * waveform.n);
-        const pxSpanBuckets = Math.max(1, Math.ceil((1 / pxPerSec) / (waveform.dur / waveform.n)));
+        const bIdx = Math.floor((t / waveform.dur) * level.n);
         let mn = 1, mx = -1;
-        for (let k = 0; k < pxSpanBuckets; k++) {
-          const idx = Math.min(waveform.n - 1, Math.max(0, bIdx + k));
-          const a = waveform.peaks[idx * 2], b = waveform.peaks[idx * 2 + 1];
+        for (let k = 0; k < span; k++) {
+          const idx = Math.min(level.n - 1, Math.max(0, bIdx + k));
+          const a = level.peaks[idx * 2], b = level.peaks[idx * 2 + 1];
           if (a < mn) mn = a; if (b > mx) mx = b;
         }
         if (mx < mn) { mn = 0; mx = 0; }
-        tlCtx.moveTo(x, midY - mx * (WAVE_H / 2 - 2));
-        tlCtx.lineTo(x, midY - mn * (WAVE_H / 2 - 2));
+        staticCtx.moveTo(x, midY - mx * (WAVE_H / 2 - 2));
+        staticCtx.lineTo(x, midY - mn * (WAVE_H / 2 - 2));
       }
-      tlCtx.stroke();
+      staticCtx.stroke();
     } else {
-      tlCtx.fillStyle = '#a9aebb'; tlCtx.font = '11px Segoe UI, sans-serif';
-      tlCtx.fillText('waveform unavailable for this file', 10, midY + 4);
+      staticCtx.fillStyle = '#a9aebb'; staticCtx.font = '11px Segoe UI, sans-serif';
+      staticCtx.fillText('waveform unavailable for this file', 10, midY + 4);
     }
-    tlCtx.fillStyle = 'rgba(68,83,216,0.06)';
-    tlCtx.fillRect(0, 0, w, RULER_H + WAVE_H);
+    staticCtx.fillStyle = 'rgba(68,83,216,0.06)';
+    staticCtx.fillRect(0, 0, w, RULER_H + WAVE_H);
 
     let boxT0 = null, boxT1 = null;
     if (drag && drag.mode === 'boxselect') {
@@ -475,64 +597,97 @@ function drawTimeline() {
       const isSel = selectedIds.has(s.id) || inBox;
       const isHover = hover.id === s.id;
 
-      roundRectPath(tlCtx, rx, STRIP_Y, rw, STRIP_H, 8);
-      tlCtx.fillStyle = colorForStrip(s);
-      tlCtx.fill();
-      tlCtx.lineWidth = isSel ? 2.4 : (isHover ? 1.6 : 1);
-      tlCtx.strokeStyle = isSel ? '#20242c' : (isHover ? '#4453d8' : 'rgba(0,0,0,0.18)');
-      tlCtx.stroke();
+      roundRectPath(staticCtx, rx, STRIP_Y, rw, STRIP_H, 8);
+      staticCtx.fillStyle = colorForStrip(s);
+      staticCtx.fill();
+      staticCtx.lineWidth = isSel ? 2.4 : (isHover ? 1.6 : 1);
+      staticCtx.strokeStyle = isSel ? '#20242c' : (isHover ? '#4453d8' : 'rgba(0,0,0,0.18)');
+      staticCtx.stroke();
 
-      tlCtx.save();
-      roundRectPath(tlCtx, rx, STRIP_Y, rw, STRIP_H, 8);
-      tlCtx.clip();
-      tlCtx.fillStyle = coreOf(s.theta).color;
-      tlCtx.fillRect(rx, STRIP_Y, 4, STRIP_H);
+      // Single clip region shared by the color bar, box-select tint, and
+      // label text (previously two separate save/clip/restore blocks —
+      // merged here since they clip to the exact same rounded rect).
+      staticCtx.save();
+      roundRectPath(staticCtx, rx, STRIP_Y, rw, STRIP_H, 8);
+      staticCtx.clip();
+      staticCtx.fillStyle = coreOf(s.theta).color;
+      staticCtx.fillRect(rx, STRIP_Y, 4, STRIP_H);
       if (inBox && !selectedIds.has(s.id)) {
-        tlCtx.fillStyle = 'rgba(68,83,216,0.18)';
-        tlCtx.fillRect(rx, STRIP_Y, rw, STRIP_H);
+        staticCtx.fillStyle = 'rgba(68,83,216,0.18)';
+        staticCtx.fillRect(rx, STRIP_Y, rw, STRIP_H);
       }
-      tlCtx.restore();
-
       if (isHover && hover.part === 'left') {
-        tlCtx.fillStyle = '#4453d8'; tlCtx.fillRect(x1 - 2, STRIP_Y + 4, 4, STRIP_H - 8);
+        staticCtx.fillStyle = '#4453d8'; staticCtx.fillRect(x1 - 2, STRIP_Y + 4, 4, STRIP_H - 8);
       }
       if (isHover && hover.part === 'right') {
-        tlCtx.fillStyle = '#4453d8'; tlCtx.fillRect(x2 - 2, STRIP_Y + 4, 4, STRIP_H - 8);
+        staticCtx.fillStyle = '#4453d8'; staticCtx.fillRect(x2 - 2, STRIP_Y + 4, 4, STRIP_H - 8);
       }
-
       if (rw > 36) {
         const leaf = leafOf(s.theta, s.r);
-        tlCtx.save();
-        roundRectPath(tlCtx, rx, STRIP_Y, rw, STRIP_H, 8); tlCtx.clip();
-        tlCtx.fillStyle = '#171a20';
-        tlCtx.font = 'bold 11px Segoe UI, sans-serif';
-        tlCtx.fillText(s.r > 0 ? leaf.word : `${leaf.word} (neutral)`, rx + 10, STRIP_Y + 18);
-        tlCtx.fillStyle = 'rgba(23,26,32,0.65)';
-        tlCtx.font = '10px Segoe UI, sans-serif';
-        tlCtx.fillText(`${leaf.core.name} · ${(s.r * 100).toFixed(0)}%`, rx + 10, STRIP_Y + 33);
-        tlCtx.restore();
+        staticCtx.fillStyle = '#171a20';
+        staticCtx.font = 'bold 11px Segoe UI, sans-serif';
+        staticCtx.fillText(s.r > 0 ? leaf.word : `${leaf.word} (neutral)`, rx + 10, STRIP_Y + 18);
+        staticCtx.fillStyle = 'rgba(23,26,32,0.65)';
+        staticCtx.font = '10px Segoe UI, sans-serif';
+        staticCtx.fillText(`${leaf.core.name} · ${(s.r * 100).toFixed(0)}%`, rx + 10, STRIP_Y + 33);
       }
+      staticCtx.restore();
     });
 
     if (boxT0 != null) {
       const bx1 = timeToX(boxT0), bx2 = timeToX(boxT1);
-      tlCtx.fillStyle = 'rgba(68,83,216,0.12)';
-      tlCtx.fillRect(bx1, 2, Math.max(1, bx2 - bx1), h - 4);
-      tlCtx.strokeStyle = '#4453d8'; tlCtx.lineWidth = 1.4;
-      tlCtx.setLineDash([4, 3]);
-      tlCtx.strokeRect(bx1, 2, Math.max(1, bx2 - bx1), h - 4);
-      tlCtx.setLineDash([]);
-    }
-
-    const px = timeToX(video.currentTime);
-    if (px >= 0 && px <= w) {
-      tlCtx.strokeStyle = '#e0433f'; tlCtx.lineWidth = 1.5;
-      tlCtx.beginPath(); tlCtx.moveTo(px, 0); tlCtx.lineTo(px, h); tlCtx.stroke();
-      tlCtx.fillStyle = '#e0433f';
-      tlCtx.beginPath(); tlCtx.moveTo(px - 5, 0); tlCtx.lineTo(px + 5, 0); tlCtx.lineTo(px, 7); tlCtx.closePath(); tlCtx.fill();
+      staticCtx.fillStyle = 'rgba(68,83,216,0.12)';
+      staticCtx.fillRect(bx1, 2, Math.max(1, bx2 - bx1), h - 4);
+      staticCtx.strokeStyle = '#4453d8'; staticCtx.lineWidth = 1.4;
+      staticCtx.setLineDash([4, 3]);
+      staticCtx.strokeRect(bx1, 2, Math.max(1, bx2 - bx1), h - 4);
+      staticCtx.setLineDash([]);
     }
   }
+}
+
+// Cheap per-frame draw: blit the cached static bitmap, then draw just the
+// playhead on top. Safe to call every animation frame during playback.
+function compositeFrame() {
+  const dpr = window.devicePixelRatio || 1;
+  tlCtx.setTransform(1, 0, 0, 1, 0, 0);
+  tlCtx.clearRect(0, 0, tl.width, tl.height);
+  tlCtx.drawImage(staticCanvas, 0, 0);
+  tlCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawPlayhead();
   updatePanSlider();
+}
+
+function drawPlayhead() {
+  if (duration <= 0) return;
+  const rect = tl.getBoundingClientRect();
+  const w = rect.width, h = rect.height || 150;
+  const px = timeToX(video.currentTime);
+  if (px >= 0 && px <= w) {
+    tlCtx.strokeStyle = '#e0433f'; tlCtx.lineWidth = 1.5;
+    tlCtx.beginPath(); tlCtx.moveTo(px, 0); tlCtx.lineTo(px, h); tlCtx.stroke();
+    tlCtx.fillStyle = '#e0433f';
+    tlCtx.beginPath(); tlCtx.moveTo(px - 5, 0); tlCtx.lineTo(px + 5, 0); tlCtx.lineTo(px, 7); tlCtx.closePath(); tlCtx.fill();
+  }
+}
+
+// Full redraw: recompute the static layer, then composite. Use this
+// whenever data or the view actually changed (zoom, pan, resize, strip
+// edits, waveform loaded, selection/hover changes). For per-frame playhead
+// updates during playback, call compositeFrame() directly instead (see raf()).
+function drawTimeline() {
+  renderStatic();
+  compositeFrame();
+}
+
+// Batches high-frequency callers (mousemove drags, wheel-zoom, resize-drag)
+// onto a single full redraw per animation frame, instead of one redraw per
+// native event (which can fire far more often than the screen refreshes).
+let drawScheduled = false;
+function requestDraw() {
+  if (drawScheduled) return;
+  drawScheduled = true;
+  requestAnimationFrame(() => { drawScheduled = false; drawTimeline(); });
 }
 function niceStep(visSec) {
   const target = visSec / 8;
@@ -581,7 +736,7 @@ window.addEventListener('pointermove', e => {
     // keep the point under the fingers fixed (combined pinch-zoom + two-finger pan)
     viewStart += (pinchStartMidTime - midT);
     clampView();
-    drawTimeline();
+    requestDraw();
   }
 });
 function endTouch(e) {
@@ -693,13 +848,13 @@ function handleMove(e) {
     const deltaX = e.clientX - drag.startX;
     viewStart = drag.startViewStart - deltaX / pxPerSec;
     clampView();
-    drawTimeline();
+    requestDraw();
     return;
   }
   if (drag && drag.mode === 'boxselect') {
     drag.currentX = x;
     drag.currentT = xToTime(x);
-    drawTimeline();
+    requestDraw();
     return;
   }
   const { STRIP_Y, STRIP_H } = getLayout();
@@ -718,11 +873,11 @@ function handleMove(e) {
       hover = { id: null, part: null };
       tl.style.cursor = 'crosshair';
     }
-    drawTimeline();
+    requestDraw();
     return;
   }
   const t = xToTime(x);
-  if (drag.mode === 'scrub') { video.currentTime = t; return; }
+  if (drag.mode === 'scrub') { video.currentTime = t; drawPlayhead(); return; }
 
   // multimove has no drag.id — handle it before the single-strip lookup
   if (drag.mode === 'multimove') {
@@ -788,7 +943,7 @@ function handleMove(e) {
     b = Math.min(drag.bounds.right, Math.max(b, s.start + 0.05));
     s.end = b;
   }
-  drawTimeline();
+  requestDraw();
 }
 
 function handleUp(e) {
@@ -880,8 +1035,9 @@ tl.addEventListener('wheel', e => {
     clampView();
   } else {
     zoomAt(x, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+    return; // zoomAt already redraws (via requestDraw internally)
   }
-  drawTimeline();
+  requestDraw();
 }, { passive: false });
 
 /* right-click context menu */
@@ -1146,7 +1302,7 @@ function mediaResizeMove(e) {
   const maxMedia = mainH - resizerH.offsetHeight - minTimeline;
   const newH = Math.max(minMedia, Math.min(maxMedia, mediaResizeStartH + delta));
   mediaWrapEl.style.height = newH + 'px';
-  drawTimeline();
+  requestDraw();
 }
 function mediaResizeEnd() { if (resizingMedia) { resizingMedia = false; document.body.style.cursor = ''; } }
 resizerH.addEventListener('mousedown', mediaResizeStart);
