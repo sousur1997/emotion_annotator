@@ -1,0 +1,24 @@
+# ── Core UI ───────────────────────────────────────────────────────────────────
+PyQt5>=5.15.0
+PyQt5-Qt5>=5.15.0
+PyQt5-sip>=12.11.0
+
+# ── Numerical (waveform processing) ──────────────────────────────────────────
+numpy>=1.24.0
+
+# ── Audio decoding (optional but recommended) ─────────────────────────────────
+# soundfile  : fast decoder for WAV / FLAC / OGG / AIFF (uses libsndfile)
+soundfile>=0.12.0
+
+# librosa    : broader format support; pulls in audioread for MP3 fallback
+#              (still needs ffmpeg on PATH for MP3)
+librosa>=0.10.0
+
+# ── System dependency (NOT a pip package) ─────────────────────────────────────
+# ffmpeg must be installed separately and available on PATH.
+# It is the universal fallback decoder used by waveform_worker.py
+# and is required for MP3 and most video formats.
+#
+#   Windows : https://ffmpeg.org/download.html  → add bin/ to PATH
+#   Ubuntu  : sudo apt install ffmpeg
+#   macOS   : brew install ffmpeg
